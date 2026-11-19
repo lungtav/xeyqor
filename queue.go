@@ -4,17 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
 type Job struct {
-	ID           string `redis:"id"`
-	WorkerID     string `redis:"worker_id"`
-	Description  string `redis:"description"`
-	FencingToken int64  `redis:"fencing_token"`
-	MaxRetries   int64  `redis:"max_retries"`
-	Attempts     int64  `redis:"attempts"`
+	ID             string `redis:"id"`
+	WorkerID       string `redis:"worker_id"`
+	Description    string `redis:"description"`
+	FencingToken   int64  `redis:"fencing_token"`
+	MaxRetries     int64  `redis:"max_retries"`
+	Attempts       int64  `redis:"attempts"`
+	IdempotencyKey string `redis:"idempotency_key"`
 }
 
 type QueueConfig struct {
@@ -31,19 +34,30 @@ var enqueueScript = redis.NewScript(
 	`local pending = KEYS[1]
 	local job = KEYS[2]
 	local notifications = KEYS[3]
+	local idempotency_key = KEYS[4]
 	local job_id = ARGV[1]
 	local job_desc = ARGV[2]
 	local job_fencing_token = ARGV[3]
 	local job_retries = ARGV[4]
 	local job_worker_id = ARGV[5]
 	local job_attempts = ARGV[6]
+	local idempotency_ttl = ARGV[7]
 
-	--checking if hash exists
+	-- Serialize idempotency lookup, job creation and key reservation in one
+	-- Redis operation so concurrent enqueue attempts cannot both succeed.
+	if idempotency_key ~= '' then
+		local existing_job_id = redis.call("GET", idempotency_key)
+		if existing_job_id then
+			if existing_job_id == job_id then
+				return 2
+			end
+			return 3
+		end
+	end
 
 	if redis.call("EXISTS", job) == 1 then
 		return 0
 	end
-		
 
 	redis.call("HSET", job, "id", job_id, "description", job_desc, "fencing_token", job_fencing_token, "worker_id", job_worker_id, "attempts", job_attempts, "max_retries", job_retries)
 
@@ -51,8 +65,13 @@ var enqueueScript = redis.NewScript(
 
 	redis.call("LPUSH", notifications, job_id)
 
+	if idempotency_key ~= '' then
+		redis.call("SET", idempotency_key, job_id, "EX", idempotency_ttl)
+	end
+
 	return 1
 `)
+var IDEMPOTENCY_KEY_TTL = time.Hour * 24
 
 func NewQueue(ctx context.Context, cfg QueueConfig) (*Queue, error) {
 
@@ -76,9 +95,7 @@ func NewQueue(ctx context.Context, cfg QueueConfig) (*Queue, error) {
 
 func (q *Queue) Enqueue(ctx context.Context, job Job) error {
 
-	if job.ID == "" {
-		return errors.New("xeyqor: job ID is required")
-	}
+	job.ID = uuid.NewString()
 
 	if job.Description == "" {
 		return errors.New("xeyqor: job description is required")
@@ -100,10 +117,32 @@ func (q *Queue) Enqueue(ctx context.Context, job Job) error {
 		return fmt.Errorf("xeyqor: new job must start at 0 attempts %d", job.Attempts)
 	}
 
-	prefix := "xeyqor:{" + q.Name + "}"
-	keys:= []string{prefix + ":pending", prefix + ":job:" + job.ID, prefix + ":notifications"}
+	prefix := "xeyqor:{" + q.Name + "}:"
 
-	result, err := enqueueScript.Run(ctx, q.Config.Redis, keys,job.ID, job.Description, job.FencingToken, job.MaxRetries, job.WorkerID, job.Attempts).Result()
+	idempotencyKey := ""
+	if job.IdempotencyKey != "" {
+		idempotencyKey = prefix + "idempotency:" + job.IdempotencyKey
+	}
+
+	keys := []string{
+		prefix + "pending",
+		prefix + "job:" + job.ID,
+		prefix + "notifications",
+		idempotencyKey,
+	}
+
+	result, err := enqueueScript.Run(
+		ctx,
+		q.Config.Redis,
+		keys,
+		job.ID,
+		job.Description,
+		job.FencingToken,
+		job.MaxRetries,
+		job.WorkerID,
+		job.Attempts,
+		int64(IDEMPOTENCY_KEY_TTL.Seconds()),
+	).Result()
 
 	if err != nil {
 		return err
@@ -120,6 +159,10 @@ func (q *Queue) Enqueue(ctx context.Context, job Job) error {
 		return errors.New("xeyqor: job already exists in queue")
 	case 1:
 		return nil
+	case 2:
+		return errors.New("xeyqor: job already exists for idempotency key")
+	case 3:
+		return errors.New("xeyqor: idempotency key conflicts")
 	default:
 		return fmt.Errorf("unexpected Lua script result: %d", count)
 	}
