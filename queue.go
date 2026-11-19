@@ -27,6 +27,33 @@ type Queue struct {
 	Config QueueConfig
 }
 
+var enqueueScript = redis.NewScript(
+	`local pending = KEYS[1]
+	local job = KEYS[2]
+	local notifications = KEYS[3]
+	local job_id = ARGV[1]
+	local job_desc = ARGV[2]
+	local job_fencing_token = ARGV[3]
+	local job_retries = ARGV[4]
+	local job_worker_id = ARGV[5]
+	local job_attempts = ARGV[6]
+
+	--checking if hash exists
+
+	if redis.call("EXISTS", job) == 1 then
+		return 0
+	end
+		
+
+	redis.call("HSET", job, "id", job_id, "description", job_desc, "fencing_token", job_fencing_token, "worker_id", job_worker_id, "attempts", job_attempts, "max_retries", job_retries)
+
+	redis.call("LPUSH", pending, job_id)
+
+	redis.call("LPUSH", notifications, job_id)
+
+	return 1
+`)
+
 func NewQueue(ctx context.Context, cfg QueueConfig) (*Queue, error) {
 
 	if cfg.Name == "" {
@@ -48,33 +75,6 @@ func NewQueue(ctx context.Context, cfg QueueConfig) (*Queue, error) {
 }
 
 func (q *Queue) Enqueue(ctx context.Context, job Job) error {
-
-	script := `
-		local pending = KEYS[1]
-		local job = KEYS[2]
-		local notifications = KEYS[3]
-		local job_id = ARGV[1]
-		local job_desc = ARGV[2]
-		local job_fencing_token = ARGV[3]
-		local job_retries = ARGV[4]
-		local job_worker_id = ARGV[5]
-		local job_attempts = ARGV[6]
-
-		--checking if hash exists
-
-		if redis.call("EXISTS", job) == 1 then
-			return 0
-		end
-		
-
-		redis.call("HSET", job, "id", job_id, "description", job_desc, "fencing_token", job_fencing_token, "worker_id", job_worker_id, "attempts", job_attempts, "max_retries", job_retries)
-
-		redis.call("LPUSH", pending, job_id)
-
-		redis.call("LPUSH", notifications, job_id)
-
-		return 1
-	`
 
 	if job.ID == "" {
 		return errors.New("xeyqor: job ID is required")
@@ -100,11 +100,10 @@ func (q *Queue) Enqueue(ctx context.Context, job Job) error {
 		return fmt.Errorf("xeyqor: new job must start at 0 attempts %d", job.Attempts)
 	}
 
-	prefix := "xeyqor:" + q.Name
+	prefix := "xeyqor:{" + q.Name + "}"
+	keys:= []string{prefix + ":pending", prefix + ":job:" + job.ID, prefix + ":notifications"}
 
-	enq := q.Config.Redis.Eval(ctx, script, []string{prefix + ":pending", prefix + ":job:" + job.ID, prefix + ":notifications"}, job.ID, job.Description, job.FencingToken, job.MaxRetries, job.WorkerID, job.Attempts)
-
-	result, err := enq.Result()
+	result, err := enqueueScript.Run(ctx, q.Config.Redis, keys,job.ID, job.Description, job.FencingToken, job.MaxRetries, job.WorkerID, job.Attempts).Result()
 
 	if err != nil {
 		return err
