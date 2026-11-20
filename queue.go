@@ -11,7 +11,6 @@ import (
 )
 
 type Job struct {
-	ID             string `redis:"id"`
 	WorkerID       string `redis:"worker_id"`
 	Description    string `redis:"description"`
 	FencingToken   int64  `redis:"fencing_token"`
@@ -71,6 +70,7 @@ var enqueueScript = redis.NewScript(
 
 	return 1
 `)
+
 var IDEMPOTENCY_KEY_TTL = time.Hour * 24
 
 func NewQueue(ctx context.Context, cfg QueueConfig) (*Queue, error) {
@@ -93,28 +93,28 @@ func NewQueue(ctx context.Context, cfg QueueConfig) (*Queue, error) {
 	}, nil
 }
 
-func (q *Queue) Enqueue(ctx context.Context, job Job) error {
+func (q *Queue) Enqueue(ctx context.Context, job Job) (jobId string, err error) {
 
-	job.ID = uuid.NewString()
+	jobID := uuid.NewString()
 
 	if job.Description == "" {
-		return errors.New("xeyqor: job description is required")
+		return "", errors.New("xeyqor: job description is required")
 	}
 
 	if job.WorkerID != "" {
-		return fmt.Errorf("xeyqor: job to enqueue should have no worker id: %s", job.WorkerID)
+		return "", fmt.Errorf("xeyqor: job to enqueue should have no worker id: %s", job.WorkerID)
 	}
 
 	if job.FencingToken < 0 {
-		return fmt.Errorf("xeyqor: invalid fencing token: %d", job.FencingToken)
+		return "", fmt.Errorf("xeyqor: invalid fencing token: %d", job.FencingToken)
 	}
 
 	if job.MaxRetries < 0 {
-		return fmt.Errorf("xeyqor: invalid maximum job retries: %d", job.MaxRetries)
+		return "", fmt.Errorf("xeyqor: invalid maximum job retries: %d", job.MaxRetries)
 	}
 
 	if job.Attempts != 0 {
-		return fmt.Errorf("xeyqor: new job must start at 0 attempts %d", job.Attempts)
+		return "", fmt.Errorf("xeyqor: new job must start at 0 attempts %d", job.Attempts)
 	}
 
 	prefix := "xeyqor:{" + q.Name + "}:"
@@ -126,7 +126,7 @@ func (q *Queue) Enqueue(ctx context.Context, job Job) error {
 
 	keys := []string{
 		prefix + "pending",
-		prefix + "job:" + job.ID,
+		prefix + "job:" + jobID,
 		prefix + "notifications",
 		idempotencyKey,
 	}
@@ -135,7 +135,7 @@ func (q *Queue) Enqueue(ctx context.Context, job Job) error {
 		ctx,
 		q.Config.Redis,
 		keys,
-		job.ID,
+		jobID,
 		job.Description,
 		job.FencingToken,
 		job.MaxRetries,
@@ -145,25 +145,25 @@ func (q *Queue) Enqueue(ctx context.Context, job Job) error {
 	).Result()
 
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	count, ok := result.(int64)
 
 	if !ok {
-		return errors.New("xeyqor: type assertion failed")
+		return "", errors.New("xeyqor: type assertion failed")
 	}
 
 	switch count {
 	case 0:
-		return errors.New("xeyqor: job already exists in queue")
+		return "", errors.New("xeyqor: job already exists in queue")
 	case 1:
-		return nil
+		return jobID, nil
 	case 2:
-		return errors.New("xeyqor: job already exists for idempotency key")
+		return "", errors.New("xeyqor: job already exists for idempotency key")
 	case 3:
-		return errors.New("xeyqor: idempotency key conflicts")
+		return "", errors.New("xeyqor: idempotency key conflicts")
 	default:
-		return fmt.Errorf("unexpected Lua script result: %d", count)
+		return "", fmt.Errorf("unexpected Lua script result: %d", count)
 	}
 }
