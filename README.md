@@ -1,7 +1,7 @@
 # xeyqor
 
 <p align="center">
-  <img src="logo.png" alt="Xeyqor logo" width="640">
+  <img src="logo.png" alt="Xeyqor logo" width="240">
 </p>
 
 **xeyqor** is an early-stage Go project exploring a Redis-backed job queue. The aim is to build a small, understandable queue with atomic job and worker operations, safe claiming, and clear retry behavior.
