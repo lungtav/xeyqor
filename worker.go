@@ -4,19 +4,89 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-type Handler func()
+type Handler func(context.Context, Job) error
+
+var claimScript = redis.NewScript(
+	`local leases = KEYS[1]
+	local pending = KEYS[2]
+	local running = KEYS[3]
+	local worker_id = ARGV[1]
+	local job_prefix = ARGV[2]
+
+	local job_id = redis.call("LMOVE", pending, running, "RIGHT", "LEFT")
+
+	if not job_id then
+		return nil
+	end
+
+	local t = redis.call("TIME")
+	local seconds = tonumber(t[1])
+	local microseconds = tonumber(t[2])
+	local milliseconds = (seconds * 1000) + math.floor(microseconds / 1000)
+
+	local lease_expiry = milliseconds + (30 * 1000)
+	redis.call("ZADD", leases, lease_expiry, job_id)
+
+	local job_key = job_prefix .. "job:" .. job_id
+	local fencing_token = redis.call("HINCRBY", job_key, "fencing_token", 1)
+	redis.call("HSET", job_key, "worker_id", worker_id)
+
+	return {job_id, fencing_token}
+`)
+	
+var heartbeatScript = redis.NewScript(
+	`local running = KEYS[1]
+	local job_key = KEYS[2]
+	local leases = KEYS[3]
+	local job_id = ARGV[1]
+	local worker_id = ARGV[2]
+	local fencing_token = ARGV[3]
+	local lease_duration = ARGV[4]
+
+	if redis.call("LPOS", running, job_id) == false then
+		return 0
+	end
+
+	if redis.call("HGET", job_key, "worker_id") ~= worker_id then
+		return 0
+	end
+
+	if tonumber(redis.call("HGET", job_key, "fencing_token")) ~= tonumber(fencing_token) then
+		return 0
+	end
+
+	local lease_expiry = redis.call("ZSCORE", leases, job_id)
+	
+	if not lease_expiry then
+		return 0
+	end
+
+	local t = redis.call("TIME")
+	local seconds = tonumber(t[1])
+	local microseconds = tonumber(t[2])
+	local milliseconds = (seconds * 1000) + math.floor(microseconds / 1000)
+
+	if tonumber(lease_expiry) <= milliseconds then
+		return 0
+	end
+
+	local new_lease = milliseconds + tonumber(lease_duration)
+
+	redis.call("ZADD", leases, new_lease, job_id)
+	return 1`)
 
 type Worker struct {
-	name  string // must match the name of the queue its listening to
+	name        string // must match the name of the queue its listening to
 	redisClient redis.UniversalClient
 }
 
 func NewWorker(ctx context.Context, name string, redisClient redis.UniversalClient) (*Worker, error) {
-	
+
 	// confirm the redis client is provided
 	if redisClient == nil {
 		return nil, errors.New("xeyqor: redis client is required")
@@ -33,24 +103,28 @@ func NewWorker(ctx context.Context, name string, redisClient redis.UniversalClie
 	}
 
 	return &Worker{
-		name: name,
+		name:        name,
 		redisClient: redisClient,
 	}, nil
 }
 
 func (w *Worker) Claim(ctx context.Context, workerID string) (Job, error) {
+	if workerID == "" {
+		return Job{}, errors.New("xeyqor: worker ID is required")
+	}
+
 	for {
 		prefix := "xeyqor:{" + w.name + "}:"
-		keys:= []string{prefix + "leases", prefix + "pending", prefix + "running"}
+		keys := []string{prefix + "leases", prefix + "pending", prefix + "running"}
 
-		result, err := claimScript.Run(ctx, w.redisClient, keys, workerID).Result()
+		result, err := claimScript.Run(ctx, w.redisClient, keys, workerID, prefix).Result()
 
 		if err != nil {
 			return Job{}, err
 		}
 
 		if result == nil {
-			_, err := w.redisClient.BLPop(ctx, 0, "veyqor:notifications").Result()
+			_, err := w.redisClient.BLPop(ctx, 0, prefix+"notifications").Result()
 
 			if err != nil {
 				return Job{}, err
@@ -71,7 +145,7 @@ func (w *Worker) Claim(ctx context.Context, workerID string) (Job, error) {
 			return Job{}, fmt.Errorf("unexpected claim result types")
 		}
 
-		jobKey := "veyqor:job:" + jobID
+		jobKey := prefix + "job:" + jobID
 		res, err := w.redisClient.HGetAll(ctx, jobKey).Result()
 		if err != nil {
 			return Job{}, err
@@ -91,4 +165,44 @@ func (w *Worker) Claim(ctx context.Context, workerID string) (Job, error) {
 
 		return job, nil
 	}
+}
+
+func (w *Worker) Heartbeat(ctx context.Context, jobID string, workerID string, fencingToken int64, leaseDuration time.Duration, ch chan error, ticker *time.Ticker) error {
+
+	if workerID == "" {
+		return errors.New("xeyqor: worker ID is required")
+	}
+	if ticker == nil {
+		return errors.New("xeyqor: ticker is required")
+	}
+	if leaseDuration <= 0 {
+		return fmt.Errorf("lease duration cannot be 0 or less")
+	}
+
+	prefix := "xeyqor:{" + w.name + "}:"
+	keys := []string{prefix + "running", prefix + "job:" + jobID, prefix + "leases"}
+
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			count, err := heartbeatScript.Run(ctx, w.redisClient, keys, jobID, workerID, fencingToken, leaseDuration.Milliseconds()).Int64()
+
+			if err != nil {
+				return err
+			}
+
+			switch count {
+			case 0:
+				return fmt.Errorf("heartbeat rejected: worker ownership of lease validation failed")
+			case 1:
+				continue
+			default:
+				return fmt.Errorf("unexpected heartbeat result %T", count)
+			}
+		}
+	}
+
 }
