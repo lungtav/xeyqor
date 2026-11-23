@@ -26,7 +26,7 @@ func TestNewQueueAndEnqueue(t *testing.T) {
 		return
 	}
 
-	if _, err:= emails.Enqueue(ctx, xeyqor.Job{
+	if _, err:= emails.Add(ctx, xeyqor.Job{
 		Description: "email:send",
 		IdempotencyKey: "345",
 	});err!=nil{
@@ -34,9 +34,9 @@ func TestNewQueueAndEnqueue(t *testing.T) {
 		return
 	}
 
-	if _, err:= emails.Enqueue(ctx, xeyqor.Job{
+	if _, err:= emails.Add(ctx, xeyqor.Job{
 		Description: "email:send",
-		IdempotencyKey: "346",
+		IdempotencyKey: "345",
 	});err!=nil{
 		t.Fatalf("enqueue error %v", err)
 		return

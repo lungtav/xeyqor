@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -29,6 +30,9 @@ type Queue struct {
 	Config QueueConfig
 }
 
+
+var IDEMPOTENCY_KEY_TTL = time.Hour * 24
+
 var enqueueScript = redis.NewScript(
 	`local pending = KEYS[1]
 	local job = KEYS[2]
@@ -47,15 +51,13 @@ var enqueueScript = redis.NewScript(
 	if idempotency_key ~= '' then
 		local existing_job_id = redis.call("GET", idempotency_key)
 		if existing_job_id then
-			if existing_job_id == job_id then
-				return 2
-			end
-			return 3
+			-- A retry gets the result of the original enqueue operation.
+			return "duplicate:" .. existing_job_id
 		end
 	end
 
 	if redis.call("EXISTS", job) == 1 then
-		return 0
+		return "exists"
 	end
 
 	redis.call("HSET", job, "id", job_id, "description", job_desc, "fencing_token", job_fencing_token, "worker_id", job_worker_id, "attempts", job_attempts, "max_retries", job_retries)
@@ -68,10 +70,8 @@ var enqueueScript = redis.NewScript(
 		redis.call("SET", idempotency_key, job_id, "EX", idempotency_ttl)
 	end
 
-	return 1
+	return "created:" .. job_id
 `)
-
-var IDEMPOTENCY_KEY_TTL = time.Hour * 24
 
 func NewQueue(ctx context.Context, cfg QueueConfig) (*Queue, error) {
 
@@ -93,7 +93,7 @@ func NewQueue(ctx context.Context, cfg QueueConfig) (*Queue, error) {
 	}, nil
 }
 
-func (q *Queue) Enqueue(ctx context.Context, job Job) (jobId string, err error) {
+func (q *Queue) Add(ctx context.Context, job Job) (jobId string, err error) {
 
 	jobID := uuid.NewString()
 
@@ -148,22 +148,20 @@ func (q *Queue) Enqueue(ctx context.Context, job Job) (jobId string, err error) 
 		return "", err
 	}
 
-	count, ok := result.(int64)
-
+	status, ok := result.(string)
 	if !ok {
-		return "", errors.New("xeyqor: type assertion failed")
+		return "", errors.New("xeyqor: unexpected Lua script result type")
 	}
 
-	switch count {
-	case 0:
+	switch {
+	case strings.HasPrefix(status, "created:"):
+		return strings.TrimPrefix(status, "created:"), nil
+	case strings.HasPrefix(status, "duplicate:"):
+		return strings.TrimPrefix(status, "duplicate:"), nil
+	case status == "exists":
 		return "", errors.New("xeyqor: job already exists in queue")
-	case 1:
-		return jobID, nil
-	case 2:
-		return "", errors.New("xeyqor: job already exists for idempotency key")
-	case 3:
-		return "", errors.New("xeyqor: idempotency key conflicts")
 	default:
-		return "", fmt.Errorf("unexpected Lua script result: %d", count)
+		return "", fmt.Errorf("xeyqor: unexpected Lua script result: %q", status)
 	}
 }
+
