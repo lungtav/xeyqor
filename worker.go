@@ -9,7 +9,12 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-type Handler func(context.Context, Job) error
+type Handler func(ctx context.Context, job Job) error
+
+const (
+	leaseDuration        = 30 * time.Second
+	leaseRenewalDuration = 10 * time.Second
+)
 
 var claimScript = redis.NewScript(
 	`local leases = KEYS[1]
@@ -125,6 +130,7 @@ var completeScript = redis.NewScript(
 
 type Worker struct {
 	name        string // must match the name of the queue its listening to
+	handler     Handler
 	redisClient redis.UniversalClient
 }
 
@@ -210,7 +216,7 @@ func (w *Worker) claim(ctx context.Context, workerID string) (Job, error) {
 	}
 }
 
-func (w *Worker) heartbeat(ctx context.Context, jobID string, workerID string, fencingToken int64, leaseDuration time.Duration, ch chan error, ticker *time.Ticker) error {
+func (w *Worker) heartbeat(ctx context.Context, jobID string, workerID string, fencingToken int64, leaseDuration time.Duration, ticker *time.Ticker) error {
 
 	if workerID == "" {
 		return errors.New("xeyqor: worker ID is required")
@@ -277,6 +283,60 @@ func (w *Worker) complete(ctx context.Context, jobID, workerID string, fencingTo
 	}
 	if count != 1 {
 		return fmt.Errorf("xeyqor: unexpected complete result: %d", count)
+	}
+
+	return nil
+}
+
+func (w *Worker) processOne(ctx context.Context, job Job) error {
+	if w.handler == nil {
+		return errors.New("xeyqor: worker handler is required")
+	}
+	if job.WorkerID == "" {
+		return errors.New("xeyqor: job has no worker ID")
+	}
+	if job.FencingToken <= 0 {
+		return errors.New("xeyqor: job has an invalid fencing token")
+	}
+
+	jobCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	ticker := time.NewTicker(leaseRenewalDuration)
+	defer ticker.Stop()
+
+	handlerDone := make(chan error, 1)
+	heartbeatDone := make(chan error, 1)
+
+	go func() {
+		heartbeatDone <- w.heartbeat(
+			jobCtx,
+			job.ID,
+			job.WorkerID,
+			job.FencingToken,
+			leaseDuration,
+			ticker,
+		)
+	}()
+
+	go func() {
+		handlerDone <- w.handler(jobCtx, job)
+	}()
+
+	select {
+	case err := <-heartbeatDone:
+		if err == nil {
+			return errors.New("xeyqor: heartbeat stopped unexpectedly")
+		}
+		return fmt.Errorf("xeyqor: heartbeat failed: %w", err)
+	case err := <-handlerDone:
+		if err != nil {
+			return fmt.Errorf("xeyqor: handler failed: %w", err)
+		}
+	}
+
+	if err := w.complete(jobCtx, job.ID, job.WorkerID, job.FencingToken); err != nil {
+		return fmt.Errorf("xeyqor: complete job: %w", err)
 	}
 
 	return nil
