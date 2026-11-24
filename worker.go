@@ -38,7 +38,7 @@ var claimScript = redis.NewScript(
 
 	return {job_id, fencing_token}
 `)
-	
+
 var heartbeatScript = redis.NewScript(
 	`local running = KEYS[1]
 	local job_key = KEYS[2]
@@ -80,6 +80,49 @@ var heartbeatScript = redis.NewScript(
 	redis.call("ZADD", leases, new_lease, job_id)
 	return 1`)
 
+var completeScript = redis.NewScript(
+	`local running = KEYS[1]
+	local leases = KEYS[2]
+	local completed = KEYS[3]
+	local job = KEYS[4]
+
+	local job_id = ARGV[1]
+	local worker_id = ARGV[2]
+	local fencing_token = tonumber(ARGV[3])
+
+	if redis.call("HGET", job, "worker_id") ~= worker_id then
+		return 0
+	end
+
+	local stored_token = tonumber(redis.call("HGET", job, "fencing_token"))
+	if not stored_token or stored_token ~= fencing_token then
+		return 0
+	end
+
+	if redis.call("LPOS", running, job_id) == false then
+		return 0
+	end
+
+	local lease_expiry = redis.call("ZSCORE", leases, job_id)
+	if not lease_expiry then
+		return 0
+	end
+
+	local t = redis.call("TIME")
+	local milliseconds = (tonumber(t[1]) * 1000) + math.floor(tonumber(t[2]) / 1000)
+	if tonumber(lease_expiry) <= milliseconds then
+		return 0
+	end
+
+	if redis.call("LREM", running, 1, job_id) ~= 1 then
+		return 0
+	end
+
+	redis.call("ZREM", leases, job_id)
+	redis.call("RPUSH", completed, job_id)
+	redis.call("HSET", job, "status", "completed", "completed_at", milliseconds)
+	return 1`)
+
 type Worker struct {
 	name        string // must match the name of the queue its listening to
 	redisClient redis.UniversalClient
@@ -108,7 +151,7 @@ func NewWorker(ctx context.Context, name string, redisClient redis.UniversalClie
 	}, nil
 }
 
-func (w *Worker) Claim(ctx context.Context, workerID string) (Job, error) {
+func (w *Worker) claim(ctx context.Context, workerID string) (Job, error) {
 	if workerID == "" {
 		return Job{}, errors.New("xeyqor: worker ID is required")
 	}
@@ -167,7 +210,7 @@ func (w *Worker) Claim(ctx context.Context, workerID string) (Job, error) {
 	}
 }
 
-func (w *Worker) Heartbeat(ctx context.Context, jobID string, workerID string, fencingToken int64, leaseDuration time.Duration, ch chan error, ticker *time.Ticker) error {
+func (w *Worker) heartbeat(ctx context.Context, jobID string, workerID string, fencingToken int64, leaseDuration time.Duration, ch chan error, ticker *time.Ticker) error {
 
 	if workerID == "" {
 		return errors.New("xeyqor: worker ID is required")
@@ -181,7 +224,6 @@ func (w *Worker) Heartbeat(ctx context.Context, jobID string, workerID string, f
 
 	prefix := "xeyqor:{" + w.name + "}:"
 	keys := []string{prefix + "running", prefix + "job:" + jobID, prefix + "leases"}
-
 
 	for {
 		select {
@@ -205,4 +247,37 @@ func (w *Worker) Heartbeat(ctx context.Context, jobID string, workerID string, f
 		}
 	}
 
+}
+
+func (w *Worker) complete(ctx context.Context, jobID, workerID string, fencingToken int64) error {
+	if jobID == "" {
+		return errors.New("xeyqor: job ID is required")
+	}
+	if workerID == "" {
+		return errors.New("xeyqor: worker ID is required")
+	}
+	if fencingToken <= 0 {
+		return errors.New("xeyqor: fencing token must be positive")
+	}
+
+	prefix := "xeyqor:{" + w.name + "}:"
+	keys := []string{
+		prefix + "running",
+		prefix + "leases",
+		prefix + "completed",
+		prefix + "job:" + jobID,
+	}
+
+	count, err := completeScript.Run(ctx, w.redisClient, keys, jobID, workerID, fencingToken).Int64()
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		return errors.New("xeyqor: job completion rejected: ownership or lease validation failed")
+	}
+	if count != 1 {
+		return fmt.Errorf("xeyqor: unexpected complete result: %d", count)
+	}
+
+	return nil
 }
