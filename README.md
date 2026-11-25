@@ -1,35 +1,27 @@
 # xeyqor
 
 <p align="center">
-  <img src="logo.png" alt="Xeyqor logo" width="240">
+  <img src="logo.png" alt="Xeyqor logo" width="400">
 </p>
 
-**xeyqor** is an early-stage Go project exploring a Redis-backed job queue. The aim is to build a small, understandable queue with atomic job and worker operations, safe claiming, and clear retry behavior.
+**xeyqor** is a small Redis-backed job queue for Go. Every state transition is a
+single Lua script, so job claiming and completion are atomic by construction.
 
-> This project is under active development. The API and Redis data layout may change, and it is not ready for production use.
+> Early-stage. The API and the Redis layout will change; not ready for
+> production use.
 
-## What works today
+## Status
 
-- Create a named queue with `NewQueue`.
-- Enqueue a job with a generated UUID and required description.
-- Store job data in a Redis hash and add its ID to the queue's pending list.
-- Optionally provide an idempotency key. The enqueue Lua script checks and reserves that key in the same atomic Redis operation that creates the job. Idempotency keys expire after 24 hours.
-
-The current API reports an error when an idempotency key has already been used. It does not yet return the original job ID for a repeated request.
-
-## Planned work
-
-- Claim jobs atomically for workers.
-- Use fencing tokens to protect against stale workers.
-- Define job acknowledgement, failure, and retry behavior.
-- Expand tests for validation, idempotency, and concurrent queue operations.
+Enqueue works today. Claiming, heartbeats, fencing tokens and completion are
+implemented, but the worker has no public run loop yet, so jobs cannot be
+consumed from outside the package.
 
 ## Requirements
 
-- Go version declared in [`go.mod`](go.mod).
-- A Redis server reachable by the `go-redis` client.
+- Go 1.27+ (see [`go.mod`](go.mod))
+- Redis 6.2+, for `LMOVE`
 
-## Enqueue a job
+## Usage
 
 ```go
 ctx := context.Background()
@@ -44,36 +36,59 @@ if err != nil {
 	return err
 }
 
-jobID, err := queue.Enqueue(ctx, xeyqor.Job{
+jobID, err := queue.Add(ctx, xeyqor.Job{
 	Description:    "email:send",
 	IdempotencyKey: "order-123-confirmation", // optional
+	MaxRetries:     3,                        // optional
 })
-if err != nil {
-	return err
-}
-
-fmt.Println("enqueued job:", jobID)
 ```
+
+`Add` rejects a job without a description, one that already has a worker, a
+negative fencing token or retry count, and one that does not start at zero
+attempts.
+
+Reusing an idempotency key returns the original job ID instead of enqueuing a
+duplicate. Keys expire after 24 hours.
 
 ## Redis keys
 
-For a queue named `emails`, the current implementation uses the `xeyqor:{emails}:` prefix:
+For a queue named `emails`, all keys share the `xeyqor:{emails}:` prefix. The
+hash tag keeps them in one cluster slot, which is what allows the scripts to
+touch several keys atomically.
 
-| Key | Purpose |
-| --- | --- |
-| `pending` | List of pending job IDs. |
-| `notifications` | List populated when a job is enqueued. |
-| `job:<id>` | Hash with the job's current fields. |
-| `idempotency:<key>` | Mapping from an idempotency key to a job ID; expires after 24 hours. |
+| Key | Type | Purpose |
+| --- | --- | --- |
+| `pending` | list | Job IDs waiting to be claimed, oldest on the right. |
+| `notifications` | list | Wake-up signal for idle workers. |
+| `running` | list | Job IDs held by a worker. |
+| `leases` | sorted set | Job ID → lease expiry in milliseconds. |
+| `completed` | list | Job IDs that finished successfully. |
+| `job:<id>` | hash | Job fields: description, worker, fencing token, attempts, retries. |
+| `idempotency:<key>` | string | Idempotency key → job ID. |
 
-This describes the current implementation, not a stable storage contract.
+The layout is an implementation detail, not a stable contract.
 
 ## Development
-
-Run the Go test suite with:
 
 ```sh
 go test ./...
 ```
 
-Contributions and feedback are welcome while the API is taking shape.
+Tests run against [`miniredis`](https://github.com/alicebob/miniredis), so no
+Redis server is required. The race detector needs cgo:
+
+```sh
+CGO_ENABLED=1 go test -race ./...
+```
+
+## Roadmap
+
+- Exported worker configuration (handler, concurrency) and a `Run` loop.
+- Expired-lease recovery: requeue up to `MaxRetries`, then dead-letter.
+- Failure and acknowledgement semantics.
+- Cleanup for completed jobs and the `completed` list.
+- Tests for claim, heartbeat, completion, lease expiry and concurrent workers.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
