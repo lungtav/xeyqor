@@ -12,6 +12,7 @@ import (
 )
 
 type Job struct {
+	ID             string `redis:"id"`
 	WorkerID       string `redis:"worker_id"`
 	Description    string `redis:"description"`
 	FencingToken   int64  `redis:"fencing_token"`
@@ -29,7 +30,6 @@ type Queue struct {
 	Name   string
 	Config QueueConfig
 }
-
 
 var IDEMPOTENCY_KEY_TTL = time.Hour * 24
 
@@ -164,4 +164,3 @@ func (q *Queue) Add(ctx context.Context, job Job) (jobId string, err error) {
 		return "", fmt.Errorf("xeyqor: unexpected Lua script result: %q", status)
 	}
 }
-
