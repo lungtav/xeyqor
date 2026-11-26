@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -333,56 +335,165 @@ func (w *Worker) complete(ctx context.Context, jobID, workerID string, fencingTo
 	return nil
 }
 
-func (w *Worker) processOne(ctx context.Context, job Job) error {
+func (w *Worker) process(ctx context.Context, jobs ...Job) error {
+	if len(jobs) == 0 {
+		return nil
+	}
 	if w.Handler == nil {
 		return errors.New("xeyqor: worker handler is required")
 	}
-	if job.WorkerID == "" {
-		return errors.New("xeyqor: job has no worker ID")
+
+	concurrency := int(w.Concurrency)
+	if concurrency < 1 {
+		return fmt.Errorf("xeyqor: worker concurrency must be positive: %d", w.Concurrency)
 	}
-	if job.FencingToken <= 0 {
-		return errors.New("xeyqor: job has an invalid fencing token")
+	if concurrency > len(jobs) {
+		concurrency = len(jobs)
 	}
 
-	jobCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// A buffered channel acts as a semaphore: a goroutine holds one slot for
+	// its entire job and releases it when the job ends.
+	semaphore := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
 
-	ticker := time.NewTicker(leaseRenewalDuration)
-	defer ticker.Stop()
-
-	handlerDone := make(chan error, 1)
-	heartbeatDone := make(chan error, 1)
-
-	go func() {
-		heartbeatDone <- w.heartbeat(
-			jobCtx,
-			job.ID,
-			job.WorkerID,
-			job.FencingToken,
-			leaseDuration,
-			ticker,
-		)
-	}()
-
-	go func() {
-		handlerDone <- w.Handler(jobCtx, job)
-	}()
-
-	select {
-	case err := <-heartbeatDone:
-		if err == nil {
-			return errors.New("xeyqor: heartbeat stopped unexpectedly")
-		}
-		return fmt.Errorf("xeyqor: heartbeat failed: %w", err)
-	case err := <-handlerDone:
-		if err != nil {
-			return fmt.Errorf("xeyqor: handler failed: %w", err)
+	var firstErr error
+	var errMu sync.Mutex
+	record := func(err error) {
+		errMu.Lock()
+		defer errMu.Unlock()
+		if firstErr == nil {
+			firstErr = err
 		}
 	}
 
-	if err := w.complete(jobCtx, job.ID, job.WorkerID, job.FencingToken); err != nil {
-		return fmt.Errorf("xeyqor: complete job: %w", err)
+schedule:
+	for _, job := range jobs {
+		// Do not start additional work after the caller has stopped the worker,
+		// even if a slot happens to be free at the same time.
+		if ctx.Err() != nil {
+			break
+		}
+
+		// Waiting for a free slot must also be interruptible by cancellation.
+		// A plain break here would only leave the select, so target the loop.
+		select {
+		case semaphore <- struct{}{}:
+		case <-ctx.Done():
+			break schedule
+		}
+
+		wg.Add(1)
+
+		go func(job Job) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+
+			if job.WorkerID == "" {
+				record(errors.New("xeyqor: job has no worker ID"))
+				return
+			}
+			if job.FencingToken <= 0 {
+				record(errors.New("xeyqor: job has an invalid fencing token"))
+				return
+			}
+
+			handlerCtx, stopHandler := context.WithCancel(ctx)
+			defer stopHandler()
+
+			heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+			defer stopHeartbeat()
+
+			ticker := time.NewTicker(leaseRenewalDuration)
+			defer ticker.Stop()
+
+			heartbeatDone := make(chan error, 1)
+			handlerDone := make(chan error, 1)
+
+			go func() {
+				heartbeatDone <- w.heartbeat(
+					heartbeatCtx,
+					job.ID,
+					job.WorkerID,
+					job.FencingToken,
+					leaseDuration,
+					ticker,
+				)
+			}()
+
+			go func() {
+				handlerDone <- w.Handler(handlerCtx, job)
+			}()
+
+			select {
+			case err := <-heartbeatDone:
+				// Stop the handler and wait: no work may outlive this job.
+				stopHandler()
+				handlerErr := <-handlerDone
+
+				if err == nil {
+					err = errors.New("xeyqor: heartbeat stopped unexpectedly")
+				} else {
+					err = fmt.Errorf("xeyqor: heartbeat failed: %w", err)
+				}
+				if handlerErr != nil && !errors.Is(handlerErr, context.Canceled) {
+					err = errors.Join(err, fmt.Errorf("xeyqor: handler failed: %w", handlerErr))
+				}
+				record(err)
+				return
+
+			case handlerErr := <-handlerDone:
+				// Stop the heartbeat before completing so the scripts cannot interleave.
+				stopHeartbeat()
+				<-heartbeatDone
+
+				if handlerErr != nil {
+					record(fmt.Errorf("xeyqor: handler failed: %w", handlerErr))
+					return
+				}
+			}
+
+			// Record success even while shutting down; otherwise the job stays in running.
+			if err := w.complete(context.WithoutCancel(ctx), job.ID, job.WorkerID, job.FencingToken); err != nil {
+				record(fmt.Errorf("xeyqor: complete job: %w", err))
+			}
+		}(job)
 	}
 
-	return nil
+	wg.Wait()
+
+	errMu.Lock()
+	defer errMu.Unlock()
+	if firstErr != nil {
+		return firstErr
+	}
+
+	return ctx.Err()
+}
+
+func (w *Worker) Run(ctx context.Context) error {
+	if w.Handler == nil {
+		return errors.New("xeyqor: worker handler is required")
+	}
+	if w.Concurrency < 1 {
+		return fmt.Errorf("xeyqor: worker concurrency must be positive: %d", w.Concurrency)
+	}
+
+	workerID := uuid.NewString()
+
+	for ctx.Err() == nil {
+		jobs, claimErr := w.claimBatch(ctx, workerID, int(w.Concurrency))
+
+		if len(jobs) > 0 {
+			_ = w.process(ctx, jobs...)
+		}
+
+		if claimErr != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return claimErr
+		}
+	}
+
+	return ctx.Err()
 }
