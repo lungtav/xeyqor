@@ -129,32 +129,56 @@ var completeScript = redis.NewScript(
 	return 1`)
 
 type Worker struct {
-	name        string // must match the name of the queue its listening to
-	handler     Handler
-	redisClient redis.UniversalClient
+	Name        string // must match the name of the queue its listening to
+	Concurrency int64  // how many jobs process runs at the same time
+	Handler     Handler
+	Redis       redis.UniversalClient
 }
 
-func NewWorker(ctx context.Context, name string, redisClient redis.UniversalClient) (*Worker, error) {
+type WorkerConfig struct {
+	Name        string
+	Concurrency int64
+	Redis       redis.UniversalClient
+	Handler     Handler
+}
+
+func NewWorker(ctx context.Context, cfg WorkerConfig) (*Worker, error) {
 
 	// confirm the redis client is provided
-	if redisClient == nil {
+	if cfg.Redis == nil {
 		return nil, errors.New("xeyqor: redis client is required")
 	}
 
-	// ping redis
-	if err := redisClient.Ping(ctx).Err(); err != nil {
-		return nil, fmt.Errorf("xeyqor: ping redis %w", err)
-	}
-
 	//confirm queue name is provided
-	if name == "" {
+	if cfg.Name == "" {
 		return nil, errors.New("xeyqor: queue name is required")
 	}
 
-	return &Worker{
-		name:        name,
-		redisClient: redisClient,
-	}, nil
+	if cfg.Concurrency < 0 {
+		return nil, fmt.Errorf("xeyqor: concurrency must not be negative: %d", cfg.Concurrency)
+	}
+
+	if cfg.Concurrency == 0 {
+		cfg.Concurrency = 1
+	}
+
+	if cfg.Handler == nil {
+		return nil, errors.New("xeyqor: handler is required")
+	}
+
+	// ping redis
+	if err := cfg.Redis.Ping(ctx).Err(); err != nil {
+		return nil, fmt.Errorf("xeyqor: ping redis %w", err)
+	}
+
+	worker := &Worker{
+		Name:        cfg.Name,
+		Concurrency: cfg.Concurrency,
+		Redis:       cfg.Redis,
+		Handler:     cfg.Handler,
+	}
+
+	return worker, nil
 }
 
 func (w *Worker) claim(ctx context.Context, workerID string) (Job, error) {
@@ -163,17 +187,17 @@ func (w *Worker) claim(ctx context.Context, workerID string) (Job, error) {
 	}
 
 	for {
-		prefix := "xeyqor:{" + w.name + "}:"
+		prefix := "xeyqor:{" + w.Name + "}:"
 		keys := []string{prefix + "leases", prefix + "pending", prefix + "running"}
 
-		result, err := claimScript.Run(ctx, w.redisClient, keys, workerID, prefix).Result()
+		result, err := claimScript.Run(ctx, w.Redis, keys, workerID, prefix).Result()
 
 		if err != nil {
 			return Job{}, err
 		}
 
 		if result == nil {
-			_, err := w.redisClient.BLPop(ctx, 0, prefix+"notifications").Result()
+			_, err := w.Redis.BLPop(ctx, 0, prefix+"notifications").Result()
 
 			if err != nil {
 				return Job{}, err
@@ -195,7 +219,7 @@ func (w *Worker) claim(ctx context.Context, workerID string) (Job, error) {
 		}
 
 		jobKey := prefix + "job:" + jobID
-		res, err := w.redisClient.HGetAll(ctx, jobKey).Result()
+		res, err := w.Redis.HGetAll(ctx, jobKey).Result()
 		if err != nil {
 			return Job{}, err
 		}
@@ -205,7 +229,7 @@ func (w *Worker) claim(ctx context.Context, workerID string) (Job, error) {
 		}
 
 		var job Job
-		if err := w.redisClient.HGetAll(ctx, jobKey).Scan(&job); err != nil {
+		if err := w.Redis.HGetAll(ctx, jobKey).Scan(&job); err != nil {
 			return Job{}, err
 		}
 
@@ -228,7 +252,7 @@ func (w *Worker) heartbeat(ctx context.Context, jobID string, workerID string, f
 		return fmt.Errorf("lease duration cannot be 0 or less")
 	}
 
-	prefix := "xeyqor:{" + w.name + "}:"
+	prefix := "xeyqor:{" + w.Name + "}:"
 	keys := []string{prefix + "running", prefix + "job:" + jobID, prefix + "leases"}
 
 	for {
@@ -236,7 +260,7 @@ func (w *Worker) heartbeat(ctx context.Context, jobID string, workerID string, f
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			count, err := heartbeatScript.Run(ctx, w.redisClient, keys, jobID, workerID, fencingToken, leaseDuration.Milliseconds()).Int64()
+			count, err := heartbeatScript.Run(ctx, w.Redis, keys, jobID, workerID, fencingToken, leaseDuration.Milliseconds()).Int64()
 
 			if err != nil {
 				return err
@@ -266,7 +290,7 @@ func (w *Worker) complete(ctx context.Context, jobID, workerID string, fencingTo
 		return errors.New("xeyqor: fencing token must be positive")
 	}
 
-	prefix := "xeyqor:{" + w.name + "}:"
+	prefix := "xeyqor:{" + w.Name + "}:"
 	keys := []string{
 		prefix + "running",
 		prefix + "leases",
@@ -274,7 +298,7 @@ func (w *Worker) complete(ctx context.Context, jobID, workerID string, fencingTo
 		prefix + "job:" + jobID,
 	}
 
-	count, err := completeScript.Run(ctx, w.redisClient, keys, jobID, workerID, fencingToken).Int64()
+	count, err := completeScript.Run(ctx, w.Redis, keys, jobID, workerID, fencingToken).Int64()
 	if err != nil {
 		return err
 	}
@@ -289,7 +313,7 @@ func (w *Worker) complete(ctx context.Context, jobID, workerID string, fencingTo
 }
 
 func (w *Worker) processOne(ctx context.Context, job Job) error {
-	if w.handler == nil {
+	if w.Handler == nil {
 		return errors.New("xeyqor: worker handler is required")
 	}
 	if job.WorkerID == "" {
@@ -320,7 +344,7 @@ func (w *Worker) processOne(ctx context.Context, job Job) error {
 	}()
 
 	go func() {
-		handlerDone <- w.handler(jobCtx, job)
+		handlerDone <- w.Handler(jobCtx, job)
 	}()
 
 	select {
