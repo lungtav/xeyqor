@@ -1,0 +1,5 @@
+# Go build cache from local test runs
+.gocache/
+
+# Temporary worker-flow demo, not part of the package
+/demo/
