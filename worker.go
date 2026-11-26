@@ -182,62 +182,83 @@ func NewWorker(ctx context.Context, cfg WorkerConfig) (*Worker, error) {
 }
 
 func (w *Worker) claim(ctx context.Context, workerID string) (Job, error) {
-	if workerID == "" {
-		return Job{}, errors.New("xeyqor: worker ID is required")
-	}
-
 	for {
-		prefix := "xeyqor:{" + w.Name + "}:"
-		keys := []string{prefix + "leases", prefix + "pending", prefix + "running"}
-
-		result, err := claimScript.Run(ctx, w.Redis, keys, workerID, prefix).Result()
-
+		job, ok, err := w.tryClaim(ctx, workerID)
 		if err != nil {
 			return Job{}, err
 		}
-
-		if result == nil {
-			_, err := w.Redis.BLPop(ctx, 0, prefix+"notifications").Result()
-
-			if err != nil {
-				return Job{}, err
-			}
-
-			continue
+		if ok {
+			return job, nil
 		}
 
-		values, ok := result.([]interface{})
-		if !ok || len(values) != 2 {
-			return Job{}, fmt.Errorf("unexpected claim result: %T", result)
-		}
-
-		jobID, ok1 := values[0].(string)
-		fencingToken, ok2 := values[1].(int64)
-
-		if !ok1 || !ok2 {
-			return Job{}, fmt.Errorf("unexpected claim result types")
-		}
-
-		jobKey := prefix + "job:" + jobID
-		res, err := w.Redis.HGetAll(ctx, jobKey).Result()
-		if err != nil {
+		if _, err := w.Redis.BLPop(ctx, 0, "xeyqor:{"+w.Name+"}:notifications").Result(); err != nil {
 			return Job{}, err
 		}
-
-		if len(res) == 0 {
-			return Job{}, fmt.Errorf("job has no data: %s", jobID)
-		}
-
-		var job Job
-		if err := w.Redis.HGetAll(ctx, jobKey).Scan(&job); err != nil {
-			return Job{}, err
-		}
-
-		job.FencingToken = fencingToken
-		job.WorkerID = workerID
-
-		return job, nil
 	}
+}
+
+func (w *Worker) tryClaim(ctx context.Context, workerID string) (Job, bool, error) {
+	if workerID == "" {
+		return Job{}, false, errors.New("xeyqor: worker ID is required")
+	}
+
+	prefix := "xeyqor:{" + w.Name + "}:"
+	keys := []string{prefix + "leases", prefix + "pending", prefix + "running"}
+
+	result, err := claimScript.Run(ctx, w.Redis, keys, workerID, prefix).Result()
+	if err != nil {
+		return Job{}, false, err
+	}
+	if result == nil {
+		return Job{}, false, nil
+	}
+
+	values, ok := result.([]interface{})
+	if !ok || len(values) != 2 {
+		return Job{}, false, fmt.Errorf("unexpected claim result: %T", result)
+	}
+
+	jobID, ok1 := values[0].(string)
+	fencingToken, ok2 := values[1].(int64)
+	if !ok1 || !ok2 {
+		return Job{}, false, errors.New("unexpected claim result types")
+	}
+
+	var job Job
+	if err := w.Redis.HGetAll(ctx, prefix+"job:"+jobID).Scan(&job); err != nil {
+		return Job{}, false, err
+	}
+	if job.ID == "" {
+		return Job{}, false, fmt.Errorf("job has no data: %s", jobID)
+	}
+
+	job.FencingToken = fencingToken
+	job.WorkerID = workerID
+
+	return job, true, nil
+}
+
+func (w *Worker) claimBatch(ctx context.Context, workerID string, n int) ([]Job, error) {
+	first, err := w.claim(ctx, workerID)
+	if err != nil {
+		return nil, err
+	}
+
+	jobs := make([]Job, 0, n)
+	jobs = append(jobs, first)
+
+	for len(jobs) < n {
+		job, ok, err := w.tryClaim(ctx, workerID)
+		if err != nil {
+			return jobs, err
+		}
+		if !ok {
+			break
+		}
+		jobs = append(jobs, job)
+	}
+
+	return jobs, nil
 }
 
 func (w *Worker) heartbeat(ctx context.Context, jobID string, workerID string, fencingToken int64, leaseDuration time.Duration, ticker *time.Ticker) error {
