@@ -12,9 +12,10 @@ single Lua script, so job claiming and completion are atomic by construction.
 
 ## Status
 
-Enqueue works today. Claiming, heartbeats, fencing tokens and completion are
-implemented, but the worker has no public run loop yet, so jobs cannot be
-consumed from outside the package.
+Enqueue and consumption work today. `Worker.Run` claims up to `Concurrency`
+jobs at a time, renews their leases while the handler runs, and records
+completion. Retries, expired-lease recovery and dead-lettering are not
+implemented yet.
 
 ## Requirements
 
@@ -50,6 +51,32 @@ attempts.
 Reusing an idempotency key returns the original job ID instead of enqueuing a
 duplicate. Keys expire after 24 hours.
 
+## Run a worker
+
+```go
+worker, err := xeyqor.NewWorker(ctx, xeyqor.WorkerConfig{
+	Name:        "emails",
+	Redis:       rdb,
+	Concurrency: 4,
+	Handler: func(ctx context.Context, job xeyqor.Job) error {
+		return sendEmail(ctx, job.Description)
+	},
+})
+if err != nil {
+	return err
+}
+
+return worker.Run(ctx) // blocks until ctx is cancelled
+```
+
+`Concurrency` defaults to 1 and `Handler` is required. `Run` claims up to
+`Concurrency` jobs per batch, runs their handlers concurrently, and waits for
+the slowest job before claiming again. When nothing is pending it blocks on the
+queue's notification list.
+
+A job whose handler fails stays in `running` until its lease expires; retries
+are not implemented yet.
+
 ## Redis keys
 
 For a queue named `emails`, all keys share the `xeyqor:{emails}:` prefix. The
@@ -83,7 +110,6 @@ CGO_ENABLED=1 go test -race ./...
 
 ## Roadmap
 
-- Exported worker configuration (handler, concurrency) and a `Run` loop.
 - Expired-lease recovery: requeue up to `MaxRetries`, then dead-letter.
 - Failure and acknowledgement semantics.
 - Cleanup for completed jobs and the `completed` list.
