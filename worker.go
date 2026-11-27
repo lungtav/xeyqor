@@ -394,8 +394,6 @@ func (w *Worker) Run(ctx context.Context) error {
 
 	workerID := uuid.NewString()
 
-	// A job holds one slot until it finishes. The next job is only claimed once
-	// a slot is free, so one slow job never leaves the other slots idle.
 	semaphore := make(chan struct{}, w.Concurrency)
 	var wg sync.WaitGroup
 
