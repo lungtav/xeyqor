@@ -208,6 +208,10 @@ func (w *Worker) tryClaim(ctx context.Context, workerID string) (Job, bool, erro
 	keys := []string{prefix + "leases", prefix + "pending", prefix + "running"}
 
 	result, err := claimScript.Run(ctx, w.Redis, keys, workerID, prefix).Result()
+
+	if errors.Is(err, redis.Nil) {
+		return Job{}, false, nil
+	}
 	if err != nil {
 		return Job{}, false, err
 	}
