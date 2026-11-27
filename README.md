@@ -69,9 +69,9 @@ if err != nil {
 return worker.Run(ctx) // blocks until ctx is cancelled
 ```
 
-`Concurrency` defaults to 1 and `Handler` is required. `Run` claims up to
-`Concurrency` jobs per batch, runs their handlers concurrently, and waits for
-the slowest job before claiming again. When nothing is pending it blocks on the
+`Concurrency` defaults to 1 and `Handler` is required. `Run` keeps up to
+`Concurrency` jobs in flight and claims the next job as soon as one finishes, so
+a slow job never idles the other slots. When nothing is pending it blocks on the
 queue's notification list.
 
 A job whose handler fails stays in `running` until its lease expires; retries
